@@ -14,7 +14,7 @@
 | `FaceDetector.onnx` + `FaceDetector.data` | ตรวจจับหน้าและ landmark |
 | `cavaface.onnx` + `cavaface.data` | สร้าง face embedding 512 มิติ |
 | `build_database.py` | สร้าง database จากรูปภาพ |
-| `recognize.py` | ทดสอบจำหน้าจากรูปภาพ |
+| `recognize.py` | จำหน้าจากรูปภาพ หรือ live camera |
 
 ### Dependencies
 
@@ -112,7 +112,11 @@ python3 build_database.py --photos my_photos/ --db my_db.npz --cavaface cavaface
 
 ---
 
-## Step 3 — ทดสอบจำหน้า
+## Step 3 — จำหน้า
+
+`recognize.py` รองรับ 2 mode โดยใช้ `--image` หรือ `--camera` (เลือกได้อย่างเดียว)
+
+### Mode A: รูปภาพ (Static Image)
 
 ```bash
 python3 recognize.py --image test.jpg --cavaface cavaface.onnx
@@ -127,20 +131,48 @@ Database loaded: ['Alice', 'Bob']
 Result : Alice  (similarity=0.821)
 ```
 
+### Mode B: Live Camera
+
+```bash
+# Mac (built-in camera)
+python3 recognize.py --camera 0 --cavaface cavaface.onnx
+
+# Qualcomm QCS6490 (USB camera)
+python3 recognize.py --camera 1 --cavaface cavaface.onnx
+```
+
+**สิ่งที่จะเห็นบนหน้าจอ:**
+```
+┌──────────────────────────────┐
+│   ┌──────────────────┐       │
+│   │ Alice (0.87)     │  ← กล่องเขียว = จำได้
+│   └──────────────────┘       │
+│                              │
+│   ┌──────────────────┐       │
+│   │ Unknown          │  ← กล่องแดง  = ไม่รู้จัก
+│   └──────────────────┘       │
+└──────────────────────────────┘
+กด ESC หรือ Q เพื่อออก
+```
+
 ถ้าได้ `Unknown` ให้ลองลด threshold:
 ```bash
 python3 recognize.py --image test.jpg --cavaface cavaface.onnx --threshold 0.35
+python3 recognize.py --camera 0   --cavaface cavaface.onnx --threshold 0.35
 ```
 
-**Options เพิ่มเติม:**
+**Options ทั้งหมด:**
 
 | Option | Default | คำอธิบาย |
 |--------|---------|-----------|
-| `--image` | (required) | รูปที่ต้องการทดสอบ |
+| `--image <path>` | — | รูปที่ต้องการทดสอบ (static mode) |
+| `--camera <id>` | — | Camera device ID (live mode) |
 | `--db` | `face_db.npz` | ไฟล์ database จาก Step 2 |
 | `--threshold` | `0.45` | ค่า cosine similarity ขั้นต่ำ (0–1) |
 | `--cavaface` | `CavaFace.onnx` | path ของ CavaFace model |
 | `--detector` | `FaceDetector.onnx` | path ของ FaceDetector model |
+
+> `--image` และ `--camera` เลือกได้แค่อย่างเดียว
 
 ---
 
@@ -188,6 +220,10 @@ cavaface-onnx-float/
 **`File doesn't exist: FaceDetector.onnx`**
 - ตรวจสอบว่า run script จากโฟลเดอร์ `cavaface-onnx-float/`
 - หรือใช้ `--detector /path/to/FaceDetector.onnx`
+
+**`Cannot open camera X`**
+- ลอง ID อื่น: `--camera 0`, `--camera 1`, `--camera 2`
+- บน Qualcomm QCS6490 camera มักอยู่ที่ index 1 หรือ 2
 
 **บน Qualcomm QCS6490 — `git lfs` ไม่มี**
 ```bash

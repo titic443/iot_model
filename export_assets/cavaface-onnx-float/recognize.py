@@ -1,11 +1,14 @@
 """
-Face recognition — compare input image against enrolled database.
+Face recognition — compare input image or live camera against enrolled database.
 
 Usage:
-    python3 recognize.py --image test.jpg
-    python3 recognize.py --image test.jpg --threshold 0.5
+    # Static image
+    python3 recognize.py --image test.jpg --cavaface cavaface.onnx
 
-Output: prints who is in the image (or "Unknown" if below threshold).
+    # Live camera
+    python3 recognize.py --camera 0 --cavaface cavaface.onnx
+
+Output: prints / overlays who is in the image (or "Unknown" if below threshold).
 """
 import argparse
 
@@ -29,7 +32,7 @@ ARCFACE_DST = np.array([
 ], dtype=np.float32)
 
 
-# ── (reuse same helpers as build_database.py) ──────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def generate_anchors(input_size: int = 256) -> np.ndarray:
     strides, anchors_per_cell = [16, 32], [2, 6]
     rows = []
@@ -65,25 +68,9 @@ def decode_boxes(raw, anchors, img_hw):
     return raw * scale + center * mask
 
 
-def box_iou(a, b):
-    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
-    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0.0, x2-x1) * max(0.0, y2-y1)
-    union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
-    return inter / union if union > 0 else 0.0
-
-
-def nms(boxes, scores, iou_thr):
-    order = scores.argsort()[::-1].tolist()
-    keep = []
-    while order:
-        i = order.pop(0); keep.append(i)
-        order = [j for j in order if box_iou(boxes[i], boxes[j]) < iou_thr]
-    return keep
-
-
-def detect_face(img_rgb, det_sess, anchors):
-    """Return ArcFace-aligned face [112,112,3] or None if no face found."""
+# ── Face detection (returns aligned face + bounding box) ──────────────────────
+def _detect(img_rgb: np.ndarray, det_sess: ort.InferenceSession, anchors: np.ndarray):
+    """Internal: run BlazeFace and return (aligned_face, box_xyxy) or (None, None)."""
     inp, scale, pt, pl = resize_pad(img_rgb, DETECT_INPUT_HW)
     name = det_sess.get_inputs()[0].name
     c1, c2, s1, s2 = det_sess.run(None, {name: inp})
@@ -96,82 +83,156 @@ def detect_face(img_rgb, det_sess, anchors):
 
     mask = scores >= SCORE_THRESHOLD
     if not mask.any():
-        return None
+        return None, None
 
     best_idx = int(np.where(mask)[0][scores[mask].argmax()])
 
-    # Extract 5 facial landmarks and map back to original image space
+    # Bounding box (for drawing)
+    cx, cy = decoded[best_idx, 0]
+    bw, bh = decoded[best_idx, 1]
+    box = np.array([
+        (cx - bw / 2 - pl) / scale,
+        (cy - bh / 2 - pt) / scale,
+        (cx + bw / 2 - pl) / scale,
+        (cy + bh / 2 - pt) / scale,
+    ])
+
+    # 5 landmarks → ArcFace alignment
     kps = decoded[best_idx, 2:7, :].copy()
     kps[:, 0] = (kps[:, 0] - pl) / scale
     kps[:, 1] = (kps[:, 1] - pt) / scale
 
-    # Affine-align to ArcFace reference positions → 112×112
     M, _ = cv2.estimateAffinePartial2D(kps, ARCFACE_DST, method=cv2.LMEDS)
     if M is None:
-        return None
-    return cv2.warpAffine(img_rgb, M, (CAVAFACE_INPUT_HW[1], CAVAFACE_INPUT_HW[0]))
+        return None, box
+
+    aligned = cv2.warpAffine(img_rgb, M, (CAVAFACE_INPUT_HW[1], CAVAFACE_INPUT_HW[0]))
+    return aligned, box
 
 
-def get_embedding(face_rgb, cava_sess):
+# ── CavaFace embedding ─────────────────────────────────────────────────────────
+def get_embedding(face_rgb: np.ndarray, cava_sess: ort.InferenceSession) -> np.ndarray:
     inp  = (face_rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
     name = cava_sess.get_inputs()[0].name
     emb  = cava_sess.run(None, {name: inp})[0].reshape(-1)
     return emb / (np.linalg.norm(emb) + 1e-8)
 
 
-# ── Recognition ────────────────────────────────────────────────────────────────
+def _match(emb: np.ndarray, database: dict, threshold: float) -> tuple[str, float]:
+    """Return (best_name, best_score). best_name='Unknown' if below threshold."""
+    best_name, best_score = "Unknown", -1.0
+    for name, db_emb in database.items():
+        score = float(np.dot(emb, db_emb))
+        if score > best_score:
+            best_score, best_name = score, name
+    if best_score < threshold:
+        best_name = "Unknown"
+    return best_name, best_score
+
+
+# ── Mode 1: Static image ───────────────────────────────────────────────────────
 def recognize(image_path: str, db_path: str, threshold: float,
               detector_path: str, cavaface_path: str) -> None:
 
-    # Load database
-    db_file = np.load(db_path)
+    db_file  = np.load(db_path)
     database = {name: db_file[name] for name in db_file.files}
     if not database:
         print("Database is empty. Run build_database.py first.")
         return
     print(f"Database loaded: {list(database.keys())}")
 
-    # Load models
     anchors   = generate_anchors()
     det_sess  = ort.InferenceSession(detector_path)
     cava_sess = ort.InferenceSession(cavaface_path)
 
-    # Load input image
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
         print(f"Cannot read image: {image_path}")
         return
     img_rgb = img_bgr[:, :, ::-1]
 
-    # Detect face
-    face = detect_face(img_rgb, det_sess, anchors)
+    face, _ = _detect(img_rgb, det_sess, anchors)
     if face is None:
         print("No face detected in the image.")
         return
 
-    # Get embedding
-    query_emb = get_embedding(face, cava_sess)
+    emb = get_embedding(face, cava_sess)
 
-    # Compare with database (cosine similarity)
-    best_name  = "Unknown"
-    best_score = -1.0
-    for name, emb in database.items():
-        score = float(np.dot(query_emb, emb))   # both L2-normalized → cosine sim
-        print(f"  {name}: {score:.3f}")
-        if score > best_score:
-            best_score = score
-            best_name  = name
+    for name, db_emb in database.items():
+        print(f"  {name}: {float(np.dot(emb, db_emb)):.3f}")
 
+    best_name, best_score = _match(emb, database, threshold)
     print()
-    if best_score >= threshold:
+    if best_name != "Unknown":
         print(f"Result : {best_name}  (similarity={best_score:.3f})")
     else:
-        print(f"Result : Unknown  (best match={best_name}, similarity={best_score:.3f} < threshold={threshold})")
+        print(f"Result : Unknown  (best similarity={best_score:.3f} < threshold={threshold})")
 
 
+# ── Mode 2: Live camera ────────────────────────────────────────────────────────
+def run_camera(camera_id: int, db_path: str, threshold: float,
+               detector_path: str, cavaface_path: str) -> None:
+
+    db_file  = np.load(db_path)
+    database = {name: db_file[name] for name in db_file.files}
+    if not database:
+        print("Database is empty. Run build_database.py first.")
+        return
+    print(f"Database loaded: {list(database.keys())}")
+
+    anchors   = generate_anchors()
+    det_sess  = ort.InferenceSession(detector_path)
+    cava_sess = ort.InferenceSession(cavaface_path)
+
+    cap = cv2.VideoCapture(camera_id)
+    if not cap.isOpened():
+        print(f"Cannot open camera {camera_id}")
+        return
+    print(f"Camera {camera_id} opened. Press ESC or Q to quit.")
+
+    while True:
+        ok, frame_bgr = cap.read()
+        if not ok:
+            print("Camera read failed.")
+            break
+
+        frame_rgb = frame_bgr[:, :, ::-1]
+        face, box = _detect(frame_rgb, det_sess, anchors)
+
+        if face is not None and box is not None:
+            emb = get_embedding(face, cava_sess)
+            best_name, best_score = _match(emb, database, threshold)
+
+            # Draw bounding box
+            x1, y1, x2, y2 = box.astype(int)
+            color = (0, 255, 0) if best_name != "Unknown" else (0, 0, 255)
+            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
+
+            # Draw label
+            label = f"{best_name} ({best_score:.2f})" if best_name != "Unknown" else "Unknown"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(frame_bgr, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
+            cv2.putText(frame_bgr, label, (x1 + 3, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+        cv2.imshow("Face Recognition  [ESC / Q to quit]", frame_bgr)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord("q")):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Face recognition")
-    parser.add_argument("--image",     required=True, help="Input image path")
+    parser = argparse.ArgumentParser(description="Face recognition (image or live camera)")
+
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--image",  type=str, help="Input image path (static mode)")
+    mode.add_argument("--camera", type=int, metavar="ID",
+                      help="Camera device ID for live mode (e.g. 0, 1, 2)")
+
     parser.add_argument("--db",        default="face_db.npz",
                         help="Database file from build_database.py (default: face_db.npz)")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
@@ -180,4 +241,7 @@ if __name__ == "__main__":
     parser.add_argument("--cavaface",  default="CavaFace.onnx")
     args = parser.parse_args()
 
-    recognize(args.image, args.db, args.threshold, args.detector, args.cavaface)
+    if args.image:
+        recognize(args.image, args.db, args.threshold, args.detector, args.cavaface)
+    else:
+        run_camera(args.camera, args.db, args.threshold, args.detector, args.cavaface)
